@@ -7,6 +7,8 @@
 #include <pthread.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <time.h>
+#include <stdarg.h>
 
 #define PORT 9410
 #define BUFFER_SIZE 4096
@@ -18,6 +20,9 @@
 
 #define STORAGE_ROOT "./agentfiles"
 #define STORAGE_DIR "./agentfiles/IT24103789"
+#define LOG_FILE "remoteops_IT24103789.log"
+
+static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 typedef struct {
     int client_fd;
@@ -51,6 +56,7 @@ void stop_monitor(monitor_state_t *monitor);
 
 int ensure_storage_directory(void);
 int valid_filename(const char *filename);
+void log_event(const char *format, ...);
 
 int main() {
 
@@ -121,6 +127,7 @@ int main() {
 
     printf("[+] Agent started successfully\n");
     printf("[+] Waiting for Controller connections...\n");
+    log_event("AGENT_START port=%d sid=%s", PORT, SID);
 
     while (1) {
 
@@ -138,6 +145,19 @@ int main() {
         printf(
             "[+] Controller connected from %s:%d\n",
             inet_ntoa(client_addr.sin_addr),
+            ntohs(client_addr.sin_port)
+        );
+
+        char accepted_ip[INET_ADDRSTRLEN] = "unknown";
+        inet_ntop(
+            AF_INET,
+            &client_addr.sin_addr,
+            accepted_ip,
+            sizeof(accepted_ip)
+        );
+        log_event(
+            "CONNECTION_OPEN ip=%s port=%d",
+            accepted_ip,
             ntohs(client_addr.sin_port)
         );
 
@@ -174,6 +194,41 @@ int main() {
     close(server_fd);
 
     return 0;
+}
+
+
+/* Append a timestamped entry to the personalised log file. */
+void log_event(const char *format, ...) {
+
+    char timestamp[64];
+    time_t now = time(NULL);
+    struct tm time_info;
+
+    localtime_r(&now, &time_info);
+    strftime(
+        timestamp,
+        sizeof(timestamp),
+        "%Y-%m-%d %H:%M:%S",
+        &time_info
+    );
+
+    pthread_mutex_lock(&log_mutex);
+
+    FILE *log_file = fopen(LOG_FILE, "a");
+
+    if (log_file != NULL) {
+        fprintf(log_file, "[%s] ", timestamp);
+
+        va_list args;
+        va_start(args, format);
+        vfprintf(log_file, format, args);
+        va_end(args);
+
+        fputc('\n', log_file);
+        fclose(log_file);
+    }
+
+    pthread_mutex_unlock(&log_mutex);
 }
 
 
@@ -887,7 +942,17 @@ void handle_put(
         filename,
         filesize
     );
-}/* GET file download */
+
+    log_event(
+        "FILE_PUT filename=%s bytes=%lld path=%s/%s",
+        filename,
+        filesize,
+        STORAGE_DIR,
+        filename
+    );
+}
+
+/* GET file download */
 void handle_get(
     int client_fd,
     const char *filename
@@ -1019,6 +1084,14 @@ void handle_get(
             filename,
             filesize
         );
+
+        log_event(
+            "FILE_GET filename=%s bytes=%ld path=%s/%s",
+            filename,
+            filesize,
+            STORAGE_DIR,
+            filename
+        );
     }
 }
 
@@ -1031,6 +1104,14 @@ void *handle_client(void *arg) {
     struct sockaddr_in client_addr = client_info->client_addr;
 
     free(client_info);
+
+    char client_ip[INET_ADDRSTRLEN] = "unknown";
+    inet_ntop(
+        AF_INET,
+        &client_addr.sin_addr,
+        client_ip,
+        sizeof(client_ip)
+    );
 
     char buffer[BUFFER_SIZE];
     int authenticated = 0;
@@ -1054,6 +1135,11 @@ void *handle_client(void *arg) {
                 "[-] Controller disconnected\n"
             );
 
+            log_event(
+                "DISCONNECT_UNGRACEFUL ip=%s",
+                client_ip
+            );
+
             break;
         }
 
@@ -1061,6 +1147,19 @@ void *handle_client(void *arg) {
             "[COMMAND] %s\n",
             buffer
         );
+
+        if (strncmp(buffer, "AUTH ", 5) == 0) {
+            log_event(
+                "COMMAND ip=%s AUTH <redacted>",
+                client_ip
+            );
+        } else {
+            log_event(
+                "COMMAND ip=%s %s",
+                client_ip,
+                buffer
+            );
+        }
 
 
         /* Authentication must happen first */
@@ -1086,11 +1185,21 @@ void *handle_client(void *arg) {
                         "OK AUTHENTICATED SID:9873"
                     );
 
+                    log_event(
+                        "AUTH_SUCCESS ip=%s",
+                        client_ip
+                    );
+
                 } else {
 
                     send_response(
                         client_fd,
                         "ERR 001 AUTH_FAILED SID:9873"
+                    );
+
+                    log_event(
+                        "AUTH_FAILED ip=%s",
+                        client_ip
                     );
                 }
 
@@ -1283,6 +1392,11 @@ void *handle_client(void *arg) {
                 "OK BYE SID:9873"
             );
 
+            log_event(
+                "DISCONNECT_GRACEFUL ip=%s",
+                client_ip
+            );
+
             break;
         }
 
@@ -1297,6 +1411,11 @@ void *handle_client(void *arg) {
     pthread_mutex_destroy(&monitor.mutex);
 
     close(client_fd);
+
+    log_event(
+        "SESSION_CLOSED ip=%s",
+        client_ip
+    );
 
     printf(
         "[-] Client session closed\n"
