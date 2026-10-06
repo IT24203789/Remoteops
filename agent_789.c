@@ -2,23 +2,35 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
 #include <arpa/inet.h>
 #include <pthread.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 
 #define PORT 9410
 #define BUFFER_SIZE 4096
+#define MAX_FILE_SIZE (10LL * 1024 * 1024)
 
 #define AUTH_TOKEN "OPS-3789"
 #define SID "SID:9873"
 
+#define STORAGE_ROOT "./agentfiles"
+#define STORAGE_DIR "./agentfiles/IT24103789"
+
 void *handle_client(void *arg);
+
 int recv_line(int sockfd, char *buffer, int maxlen);
+int send_all(int sockfd, const void *buffer, size_t length);
 void send_response(int sockfd, const char *message);
 
 void handle_sysinfo(int client_fd);
 void handle_listproc(int client_fd);
 void handle_exec(int client_fd, const char *command_name);
+void handle_put(int client_fd, const char *filename, long long filesize);
+
+int ensure_storage_directory(void);
+int valid_filename(const char *filename);
 
 int main() {
 
@@ -33,7 +45,13 @@ int main() {
     printf(" RemoteOps Agent - IT24103789\n");
     printf(" Listening Port : %d\n", PORT);
     printf(" Session ID     : %s\n", SID);
+    printf(" Storage Path   : %s\n", STORAGE_DIR);
     printf("=====================================\n");
+
+    if (ensure_storage_directory() != 0) {
+        fprintf(stderr, "Failed to create storage directory\n");
+        return 1;
+    }
 
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
 
@@ -138,6 +156,88 @@ int main() {
 }
 
 
+/* Create personalised file-storage directory */
+int ensure_storage_directory(void) {
+
+    if (mkdir(STORAGE_ROOT, 0755) < 0 && errno != EEXIST) {
+        perror("mkdir agentfiles");
+        return -1;
+    }
+
+    if (mkdir(STORAGE_DIR, 0755) < 0 && errno != EEXIST) {
+        perror("mkdir personalised storage");
+        return -1;
+    }
+
+    return 0;
+}
+
+
+/* Basic filename validation to prevent path traversal */
+int valid_filename(const char *filename) {
+
+    if (filename == NULL || strlen(filename) == 0) {
+        return 0;
+    }
+
+    if (strcmp(filename, ".") == 0 ||
+        strcmp(filename, "..") == 0) {
+        return 0;
+    }
+
+    if (strchr(filename, '/') != NULL ||
+        strchr(filename, '\\') != NULL) {
+        return 0;
+    }
+
+    if (strstr(filename, "..") != NULL) {
+        return 0;
+    }
+
+    return 1;
+}
+
+
+/* Send exactly length bytes */
+int send_all(
+    int sockfd,
+    const void *buffer,
+    size_t length
+) {
+
+    const char *data = buffer;
+    size_t total = 0;
+
+    while (total < length) {
+
+        ssize_t sent = send(
+            sockfd,
+            data + total,
+            length - total,
+            0
+        );
+
+        if (sent < 0) {
+
+            if (errno == EINTR) {
+                continue;
+            }
+
+            return -1;
+        }
+
+        if (sent == 0) {
+            return -1;
+        }
+
+        total += (size_t)sent;
+    }
+
+    return 0;
+}
+
+
+/* Receive one complete protocol line */
 int recv_line(int sockfd, char *buffer, int maxlen) {
 
     int index = 0;
@@ -158,6 +258,11 @@ int recv_line(int sockfd, char *buffer, int maxlen) {
         }
 
         if (received < 0) {
+
+            if (errno == EINTR) {
+                continue;
+            }
+
             return -1;
         }
 
@@ -176,6 +281,7 @@ int recv_line(int sockfd, char *buffer, int maxlen) {
 }
 
 
+/* Send one line response */
 void send_response(int sockfd, const char *message) {
 
     char response[BUFFER_SIZE];
@@ -187,15 +293,15 @@ void send_response(int sockfd, const char *message) {
         message
     );
 
-    send(
+    send_all(
         sockfd,
         response,
-        strlen(response),
-        0
+        strlen(response)
     );
 }
 
 
+/* SYSINFO */
 void handle_sysinfo(int client_fd) {
 
     FILE *file;
@@ -312,7 +418,6 @@ void handle_sysinfo(int client_fd) {
 
     fclose(file);
 
-
     snprintf(
         response,
         sizeof(response),
@@ -329,6 +434,7 @@ void handle_sysinfo(int client_fd) {
 }
 
 
+/* LISTPROC */
 void handle_listproc(int client_fd) {
 
     FILE *pipe;
@@ -397,7 +503,6 @@ void handle_listproc(int client_fd) {
             strlen(" SID:9873") +
             1 >= sizeof(response)
         ) {
-
             break;
         }
 
@@ -408,7 +513,6 @@ void handle_listproc(int client_fd) {
         );
 
         used += entry_length;
-
         response[used] = '\0';
 
         first = 0;
@@ -442,7 +546,11 @@ void handle_listproc(int client_fd) {
 }
 
 
-void handle_exec(int client_fd, const char *command_name) {
+/* Restricted EXEC command */
+void handle_exec(
+    int client_fd,
+    const char *command_name
+) {
 
     const char *shell_command = NULL;
 
@@ -451,7 +559,6 @@ void handle_exec(int client_fd, const char *command_name) {
     char response[BUFFER_SIZE];
 
     FILE *pipe;
-
 
     if (strcmp(command_name, "DATE") == 0) {
 
@@ -483,7 +590,6 @@ void handle_exec(int client_fd, const char *command_name) {
         return;
     }
 
-
     pipe = popen(shell_command, "r");
 
     if (pipe == NULL) {
@@ -495,7 +601,6 @@ void handle_exec(int client_fd, const char *command_name) {
 
         return;
     }
-
 
     while (fgets(
                line,
@@ -531,15 +636,9 @@ void handle_exec(int client_fd, const char *command_name) {
 
     pclose(pipe);
 
-
     if (strlen(output) == 0) {
-
-        strcpy(
-            output,
-            "(no output)"
-        );
+        strcpy(output, "(no output)");
     }
-
 
     snprintf(
         response,
@@ -555,6 +654,156 @@ void handle_exec(int client_fd, const char *command_name) {
 }
 
 
+/* PUT file upload */
+void handle_put(
+    int client_fd,
+    const char *filename,
+    long long filesize
+) {
+
+    char filepath[BUFFER_SIZE];
+    char response[BUFFER_SIZE];
+    char file_buffer[BUFFER_SIZE];
+
+    long long remaining;
+    FILE *file;
+
+    if (!valid_filename(filename)) {
+
+        send_response(
+            client_fd,
+            "ERR 009 INVALID_FILENAME SID:9873"
+        );
+
+        return;
+    }
+
+    if (filesize < 0) {
+
+        send_response(
+            client_fd,
+            "ERR 009 INVALID_FILESIZE SID:9873"
+        );
+
+        return;
+    }
+
+    if (filesize > MAX_FILE_SIZE) {
+
+        /*
+         * Controller in this implementation checks the
+         * same limit before transmitting file data.
+         */
+        send_response(
+            client_fd,
+            "ERR 004 FILE_TOO_LARGE SID:9873"
+        );
+
+        return;
+    }
+
+    snprintf(
+        filepath,
+        sizeof(filepath),
+        "%s/%s",
+        STORAGE_DIR,
+        filename
+    );
+
+    file = fopen(filepath, "wb");
+
+    if (file == NULL) {
+
+        send_response(
+            client_fd,
+            "ERR 010 FILE_WRITE_FAILED SID:9873"
+        );
+
+        return;
+    }
+
+    remaining = filesize;
+
+    while (remaining > 0) {
+
+        size_t amount =
+            remaining > (long long)sizeof(file_buffer)
+                ? sizeof(file_buffer)
+                : (size_t)remaining;
+
+        ssize_t received = recv(
+            client_fd,
+            file_buffer,
+            amount,
+            0
+        );
+
+        if (received < 0) {
+
+            if (errno == EINTR) {
+                continue;
+            }
+
+            fclose(file);
+            remove(filepath);
+
+            return;
+        }
+
+        if (received == 0) {
+
+            fclose(file);
+            remove(filepath);
+
+            return;
+        }
+
+        size_t written = fwrite(
+            file_buffer,
+            1,
+            (size_t)received,
+            file
+        );
+
+        if (written != (size_t)received) {
+
+            fclose(file);
+            remove(filepath);
+
+            send_response(
+                client_fd,
+                "ERR 010 FILE_WRITE_FAILED SID:9873"
+            );
+
+            return;
+        }
+
+        remaining -= received;
+    }
+
+    fclose(file);
+
+    snprintf(
+        response,
+        sizeof(response),
+        "OK FILE_RECEIVED %s SID:9873",
+        filename
+    );
+
+    send_response(
+        client_fd,
+        response
+    );
+
+    printf(
+        "[FILE] Received %s (%lld bytes)\n",
+        filename,
+        filesize
+    );
+}
+
+
+/* Handle each Controller */
 void *handle_client(void *arg) {
 
     int client_fd = *((int *)arg);
@@ -588,24 +837,21 @@ void *handle_client(void *arg) {
         );
 
 
+        /* Authentication must happen first */
         if (!authenticated) {
 
-            if (
-                strncmp(
+            if (strncmp(
                     buffer,
                     "AUTH ",
                     5
-                ) == 0
-            ) {
+                ) == 0) {
 
                 char *token = buffer + 5;
 
-                if (
-                    strcmp(
+                if (strcmp(
                         token,
                         AUTH_TOKEN
-                    ) == 0
-                ) {
+                    ) == 0) {
 
                     authenticated = 1;
 
@@ -637,7 +883,6 @@ void *handle_client(void *arg) {
         if (strcmp(buffer, "SYSINFO") == 0) {
 
             handle_sysinfo(client_fd);
-
             continue;
         }
 
@@ -645,7 +890,6 @@ void *handle_client(void *arg) {
         if (strcmp(buffer, "LISTPROC") == 0) {
 
             handle_listproc(client_fd);
-
             continue;
         }
 
@@ -657,6 +901,64 @@ void *handle_client(void *arg) {
             handle_exec(
                 client_fd,
                 command_name
+            );
+
+            continue;
+        }
+
+
+        if (strncmp(buffer, "PUT ", 4) == 0) {
+
+            char *arguments = buffer + 4;
+
+            char *last_space =
+                strrchr(arguments, ' ');
+
+            if (last_space == NULL) {
+
+                send_response(
+                    client_fd,
+                    "ERR 009 INVALID_PUT_FORMAT SID:9873"
+                );
+
+                continue;
+            }
+
+            *last_space = '\0';
+
+            char *filename = arguments;
+            char *size_text = last_space + 1;
+
+            char *endptr = NULL;
+
+            errno = 0;
+
+            long long filesize =
+                strtoll(
+                    size_text,
+                    &endptr,
+                    10
+                );
+
+            if (
+                errno != 0 ||
+                endptr == size_text ||
+                *endptr != '\0' ||
+                filesize < 0
+            ) {
+
+                send_response(
+                    client_fd,
+                    "ERR 009 INVALID_FILESIZE SID:9873"
+                );
+
+                continue;
+            }
+
+            handle_put(
+                client_fd,
+                filename,
+                filesize
             );
 
             continue;
