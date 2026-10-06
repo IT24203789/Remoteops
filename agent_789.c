@@ -15,8 +15,10 @@
 void *handle_client(void *arg);
 int recv_line(int sockfd, char *buffer, int maxlen);
 void send_response(int sockfd, const char *message);
+
 void handle_sysinfo(int client_fd);
 void handle_listproc(int client_fd);
+void handle_exec(int client_fd, const char *command_name);
 
 int main() {
 
@@ -91,7 +93,6 @@ int main() {
         );
 
         if (client_fd < 0) {
-
             perror("accept");
             continue;
         }
@@ -105,7 +106,6 @@ int main() {
         int *client_socket = malloc(sizeof(int));
 
         if (client_socket == NULL) {
-
             close(client_fd);
             continue;
         }
@@ -138,7 +138,6 @@ int main() {
 }
 
 
-/* Receive one complete line from the TCP connection */
 int recv_line(int sockfd, char *buffer, int maxlen) {
 
     int index = 0;
@@ -177,7 +176,6 @@ int recv_line(int sockfd, char *buffer, int maxlen) {
 }
 
 
-/* Send a single protocol response line */
 void send_response(int sockfd, const char *message) {
 
     char response[BUFFER_SIZE];
@@ -198,7 +196,6 @@ void send_response(int sockfd, const char *message) {
 }
 
 
-/* Handle SYSINFO command */
 void handle_sysinfo(int client_fd) {
 
     FILE *file;
@@ -213,7 +210,6 @@ void handle_sysinfo(int client_fd) {
     char line[256];
     char response[BUFFER_SIZE];
 
-    /* Read CPU load */
     file = fopen("/proc/loadavg", "r");
 
     if (file == NULL) {
@@ -241,7 +237,6 @@ void handle_sysinfo(int client_fd) {
     fclose(file);
 
 
-    /* Read memory information */
     file = fopen("/proc/meminfo", "r");
 
     if (file == NULL) {
@@ -291,7 +286,6 @@ void handle_sysinfo(int client_fd) {
         (mem_total_kb - mem_available_kb) / 1024;
 
 
-    /* Read uptime */
     file = fopen("/proc/uptime", "r");
 
     if (file == NULL) {
@@ -335,7 +329,6 @@ void handle_sysinfo(int client_fd) {
 }
 
 
-/* Handle LISTPROC command */
 void handle_listproc(int client_fd) {
 
     FILE *pipe;
@@ -398,10 +391,6 @@ void handle_listproc(int client_fd) {
 
         size_t entry_length = strlen(entry);
 
-        /*
-         * Keep enough space for:
-         * " SID:9873" and terminating null byte.
-         */
         if (
             used +
             entry_length +
@@ -453,7 +442,119 @@ void handle_listproc(int client_fd) {
 }
 
 
-/* Handle each Controller in its own thread */
+void handle_exec(int client_fd, const char *command_name) {
+
+    const char *shell_command = NULL;
+
+    char output[2048] = "";
+    char line[256];
+    char response[BUFFER_SIZE];
+
+    FILE *pipe;
+
+
+    if (strcmp(command_name, "DATE") == 0) {
+
+        shell_command = "date";
+
+    } else if (strcmp(command_name, "UPTIME") == 0) {
+
+        shell_command = "uptime";
+
+    } else if (strcmp(command_name, "DISKFREE") == 0) {
+
+        shell_command = "df -h / | tail -n 1";
+
+    } else if (strcmp(command_name, "HOSTNAME") == 0) {
+
+        shell_command = "hostname";
+
+    } else if (strcmp(command_name, "WHOAMI") == 0) {
+
+        shell_command = "whoami";
+
+    } else {
+
+        send_response(
+            client_fd,
+            "ERR 002 COMMAND_NOT_ALLOWED SID:9873"
+        );
+
+        return;
+    }
+
+
+    pipe = popen(shell_command, "r");
+
+    if (pipe == NULL) {
+
+        send_response(
+            client_fd,
+            "ERR 008 EXEC_FAILED SID:9873"
+        );
+
+        return;
+    }
+
+
+    while (fgets(
+               line,
+               sizeof(line),
+               pipe
+           ) != NULL) {
+
+        line[strcspn(line, "\r\n")] = '\0';
+
+        if (strlen(line) == 0) {
+            continue;
+        }
+
+        if (strlen(output) > 0) {
+
+            strncat(
+                output,
+                " ",
+                sizeof(output) -
+                strlen(output) -
+                1
+            );
+        }
+
+        strncat(
+            output,
+            line,
+            sizeof(output) -
+            strlen(output) -
+            1
+        );
+    }
+
+    pclose(pipe);
+
+
+    if (strlen(output) == 0) {
+
+        strcpy(
+            output,
+            "(no output)"
+        );
+    }
+
+
+    snprintf(
+        response,
+        sizeof(response),
+        "OK EXEC_RESULT %.3500s SID:9873",
+        output
+    );
+
+    send_response(
+        client_fd,
+        response
+    );
+}
+
+
 void *handle_client(void *arg) {
 
     int client_fd = *((int *)arg);
@@ -487,7 +588,6 @@ void *handle_client(void *arg) {
         );
 
 
-        /* Authentication required first */
         if (!authenticated) {
 
             if (
@@ -534,45 +634,36 @@ void *handle_client(void *arg) {
         }
 
 
-        /* SYSINFO */
-        if (
-            strcmp(
-                buffer,
-                "SYSINFO"
-            ) == 0
-        ) {
+        if (strcmp(buffer, "SYSINFO") == 0) {
 
-            handle_sysinfo(
-                client_fd
+            handle_sysinfo(client_fd);
+
+            continue;
+        }
+
+
+        if (strcmp(buffer, "LISTPROC") == 0) {
+
+            handle_listproc(client_fd);
+
+            continue;
+        }
+
+
+        if (strncmp(buffer, "EXEC ", 5) == 0) {
+
+            char *command_name = buffer + 5;
+
+            handle_exec(
+                client_fd,
+                command_name
             );
 
             continue;
         }
 
 
-        /* LISTPROC */
-        if (
-            strcmp(
-                buffer,
-                "LISTPROC"
-            ) == 0
-        ) {
-
-            handle_listproc(
-                client_fd
-            );
-
-            continue;
-        }
-
-
-        /* QUIT */
-        if (
-            strcmp(
-                buffer,
-                "QUIT"
-            ) == 0
-        ) {
+        if (strcmp(buffer, "QUIT") == 0) {
 
             send_response(
                 client_fd,
@@ -583,7 +674,6 @@ void *handle_client(void *arg) {
         }
 
 
-        /* Unknown command */
         send_response(
             client_fd,
             "ERR 003 UNKNOWN_COMMAND SID:9873"
