@@ -1,0 +1,21 @@
+# Compiled binaries
+agent_789
+controller_789
+
+# Object files
+*.o
+
+# Temporary files
+*.tmp
+*~
+
+# Downloaded test files
+downloaded_*
+
+# Core dumps
+core
+core.*
+
+# OS/editor files
+.DS_Store
+.vscode/
