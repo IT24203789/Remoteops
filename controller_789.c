@@ -23,7 +23,10 @@ int handle_put(
     int sockfd,
     const char *filepath
 );
-
+int handle_get(
+    int sockfd,
+    const char *filename
+);
 int main(int argc, char *argv[]) {
 
     int sockfd;
@@ -152,7 +155,39 @@ int main(int argc, char *argv[]) {
             );
 
             continue;
-        }
+        }/*
+ * GET is handled specially because a successful
+ * response is followed immediately by raw file bytes.
+ */
+if (strncmp(
+        command,
+        "GET ",
+        4
+    ) == 0) {
+
+    const char *filename =
+        command + 4;
+
+    while (*filename == ' ') {
+        filename++;
+    }
+
+    if (*filename == '\0') {
+
+        printf(
+            "Usage: GET <filename>\n"
+        );
+
+        continue;
+    }
+
+    handle_get(
+        sockfd,
+        filename
+    );
+
+    continue;
+}
 
 /*
  * Normal text protocol command.
@@ -452,7 +487,214 @@ int handle_put(
 
     return 0;
 }
+/* GET file from Agent */
+int handle_get(
+    int sockfd,
+    const char *filename
+) {
 
+    char request[BUFFER_SIZE];
+    char response[BUFFER_SIZE];
+    char file_buffer[BUFFER_SIZE];
+    char output_filename[BUFFER_SIZE];
+
+    if (
+        strchr(filename, '/') != NULL ||
+        strchr(filename, '\\') != NULL
+    ) {
+
+        printf(
+            "[-] GET requires a filename only\n"
+        );
+
+        return -1;
+    }
+
+    snprintf(
+        request,
+        sizeof(request),
+        "GET %s\n",
+        filename
+    );
+
+    if (send_all(
+            sockfd,
+            request,
+            strlen(request)
+        ) != 0) {
+
+        printf(
+            "[-] Failed to send GET command\n"
+        );
+
+        return -1;
+    }
+
+    int result = recv_line(
+        sockfd,
+        response,
+        sizeof(response)
+    );
+
+    if (result <= 0) {
+
+        printf(
+            "[-] Agent disconnected during GET\n"
+        );
+
+        return -1;
+    }
+
+    /*
+     * Error response such as:
+     * ERR 005 FILE_NOT_FOUND SID:9873
+     */
+    if (strncmp(
+            response,
+            "ERR ",
+            4
+        ) == 0) {
+
+        printf(
+            "%s\n",
+            response
+        );
+
+        return -1;
+    }
+
+    char received_filename[256];
+    long long filesize;
+    char sid[64];
+
+    if (sscanf(
+            response,
+            "OK FILE_SEND %255s %lld %63s",
+            received_filename,
+            &filesize,
+            sid
+        ) != 3) {
+
+        printf(
+            "[-] Invalid GET response: %s\n",
+            response
+        );
+
+        return -1;
+    }
+
+    if (
+        filesize < 0 ||
+        strcmp(sid, "SID:9873") != 0
+    ) {
+
+        printf(
+            "[-] Invalid GET metadata\n"
+        );
+
+        return -1;
+    }
+
+    snprintf(
+        output_filename,
+        sizeof(output_filename),
+        "downloaded_%s",
+        received_filename
+    );
+
+    FILE *file = fopen(
+        output_filename,
+        "wb"
+    );
+
+    if (file == NULL) {
+
+        perror("fopen");
+
+        return -1;
+    }
+
+    long long remaining = filesize;
+
+    while (remaining > 0) {
+
+        size_t amount =
+            remaining > (long long)sizeof(file_buffer)
+                ? sizeof(file_buffer)
+                : (size_t)remaining;
+
+        ssize_t received = recv(
+            sockfd,
+            file_buffer,
+            amount,
+            0
+        );
+
+        if (received < 0) {
+
+            if (errno == EINTR) {
+                continue;
+            }
+
+            fclose(file);
+            remove(output_filename);
+
+            printf(
+                "[-] Failed while receiving file\n"
+            );
+
+            return -1;
+        }
+
+        if (received == 0) {
+
+            fclose(file);
+            remove(output_filename);
+
+            printf(
+                "[-] Agent disconnected during file transfer\n"
+            );
+
+            return -1;
+        }
+
+        size_t written = fwrite(
+            file_buffer,
+            1,
+            (size_t)received,
+            file
+        );
+
+        if (written != (size_t)received) {
+
+            fclose(file);
+            remove(output_filename);
+
+            printf(
+                "[-] Failed to write downloaded file\n"
+            );
+
+            return -1;
+        }
+
+        remaining -= received;
+    }
+
+    fclose(file);
+
+    printf(
+        "%s\n",
+        response
+    );
+
+    printf(
+        "[+] Downloaded as %s (%lld bytes)\n",
+        output_filename,
+        filesize
+    );
+
+    return 0;
+}
 
 /* Receive one protocol line */
 int recv_line(

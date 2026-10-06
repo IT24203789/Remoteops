@@ -28,6 +28,7 @@ void handle_sysinfo(int client_fd);
 void handle_listproc(int client_fd);
 void handle_exec(int client_fd, const char *command_name);
 void handle_put(int client_fd, const char *filename, long long filesize);
+void handle_get(int client_fd, const char *filename);
 
 int ensure_storage_directory(void);
 int valid_filename(const char *filename);
@@ -800,6 +801,139 @@ void handle_put(
         filename,
         filesize
     );
+}/* GET file download */
+void handle_get(
+    int client_fd,
+    const char *filename
+) {
+
+    char filepath[BUFFER_SIZE];
+    char response[BUFFER_SIZE];
+    char file_buffer[BUFFER_SIZE];
+
+    FILE *file;
+
+    if (!valid_filename(filename)) {
+
+        send_response(
+            client_fd,
+            "ERR 005 FILE_NOT_FOUND SID:9873"
+        );
+
+        return;
+    }
+
+    snprintf(
+        filepath,
+        sizeof(filepath),
+        "%s/%s",
+        STORAGE_DIR,
+        filename
+    );
+
+    file = fopen(filepath, "rb");
+
+    if (file == NULL) {
+
+        send_response(
+            client_fd,
+            "ERR 005 FILE_NOT_FOUND SID:9873"
+        );
+
+        return;
+    }
+
+    if (fseek(file, 0, SEEK_END) != 0) {
+
+        fclose(file);
+
+        send_response(
+            client_fd,
+            "ERR 005 FILE_NOT_FOUND SID:9873"
+        );
+
+        return;
+    }
+
+    long filesize = ftell(file);
+
+    if (filesize < 0) {
+
+        fclose(file);
+
+        send_response(
+            client_fd,
+            "ERR 005 FILE_NOT_FOUND SID:9873"
+        );
+
+        return;
+    }
+
+    rewind(file);
+
+    snprintf(
+        response,
+        sizeof(response),
+        "OK FILE_SEND %s %ld SID:9873",
+        filename,
+        filesize
+    );
+
+    send_response(
+        client_fd,
+        response
+    );
+
+    long total_sent = 0;
+
+    while (total_sent < filesize) {
+
+        size_t amount = fread(
+            file_buffer,
+            1,
+            sizeof(file_buffer),
+            file
+        );
+
+        if (amount == 0) {
+
+            if (ferror(file)) {
+                printf(
+                    "[-] Error reading file %s\n",
+                    filename
+                );
+            }
+
+            break;
+        }
+
+        if (send_all(
+                client_fd,
+                file_buffer,
+                amount
+            ) != 0) {
+
+            printf(
+                "[-] Error sending file %s\n",
+                filename
+            );
+
+            break;
+        }
+
+        total_sent += (long)amount;
+    }
+
+    fclose(file);
+
+    if (total_sent == filesize) {
+
+        printf(
+            "[FILE] Sent %s (%ld bytes)\n",
+            filename,
+            filesize
+        );
+    }
 }
 
 
@@ -962,7 +1096,31 @@ void *handle_client(void *arg) {
             );
 
             continue;
-        }
+        }if (strncmp(buffer, "GET ", 4) == 0) {
+
+    char *filename = buffer + 4;
+
+    while (*filename == ' ') {
+        filename++;
+    }
+
+    if (*filename == '\0') {
+
+        send_response(
+            client_fd,
+            "ERR 005 FILE_NOT_FOUND SID:9873"
+        );
+
+        continue;
+    }
+
+    handle_get(
+        client_fd,
+        filename
+    );
+
+    continue;
+}
 
 
         if (strcmp(buffer, "QUIT") == 0) {
