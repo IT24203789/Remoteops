@@ -11,6 +11,7 @@
 #define PORT 9410
 #define BUFFER_SIZE 4096
 #define MAX_FILE_SIZE (10LL * 1024 * 1024)
+#define MONITOR_INTERVAL 5
 
 #define AUTH_TOKEN "OPS-3789"
 #define SID "SID:9873"
@@ -18,7 +19,22 @@
 #define STORAGE_ROOT "./agentfiles"
 #define STORAGE_DIR "./agentfiles/IT24103789"
 
+typedef struct {
+    int client_fd;
+    struct sockaddr_in client_addr;
+} client_info_t;
+
+typedef struct {
+    pthread_t thread;
+    pthread_mutex_t mutex;
+    int active;
+    int thread_started;
+    int udp_socket;
+    struct sockaddr_in target_addr;
+} monitor_state_t;
+
 void *handle_client(void *arg);
+void *monitor_thread(void *arg);
 
 int recv_line(int sockfd, char *buffer, int maxlen);
 int send_all(int sockfd, const void *buffer, size_t length);
@@ -29,6 +45,9 @@ void handle_listproc(int client_fd);
 void handle_exec(int client_fd, const char *command_name);
 void handle_put(int client_fd, const char *filename, long long filesize);
 void handle_get(int client_fd, const char *filename);
+int read_system_stats(double *cpu_load, long *mem_used_mb, double *uptime);
+int start_monitor(monitor_state_t *monitor, const struct sockaddr_in *client_addr, int udp_port);
+void stop_monitor(monitor_state_t *monitor);
 
 int ensure_storage_directory(void);
 int valid_filename(const char *filename);
@@ -122,14 +141,15 @@ int main() {
             ntohs(client_addr.sin_port)
         );
 
-        int *client_socket = malloc(sizeof(int));
+        client_info_t *client_info = malloc(sizeof(client_info_t));
 
-        if (client_socket == NULL) {
+        if (client_info == NULL) {
             close(client_fd);
             continue;
         }
 
-        *client_socket = client_fd;
+        client_info->client_fd = client_fd;
+        client_info->client_addr = client_addr;
 
         pthread_t thread_id;
 
@@ -137,13 +157,13 @@ int main() {
                 &thread_id,
                 NULL,
                 handle_client,
-                client_socket
+                client_info
             ) != 0) {
 
             perror("pthread_create");
 
             close(client_fd);
-            free(client_socket);
+            free(client_info);
 
             continue;
         }
@@ -302,122 +322,192 @@ void send_response(int sockfd, const char *message) {
 }
 
 
-/* SYSINFO */
-void handle_sysinfo(int client_fd) {
-
+/* Read Linux system statistics used by SYSINFO and UDP monitoring */
+int read_system_stats(
+    double *cpu_load,
+    long *mem_used_mb,
+    double *uptime
+) {
     FILE *file;
-
-    double cpu_load = 0.0;
-    double uptime = 0.0;
-
     long mem_total_kb = 0;
     long mem_available_kb = 0;
-    long mem_used_mb = 0;
-
     char line[256];
-    char response[BUFFER_SIZE];
 
     file = fopen("/proc/loadavg", "r");
-
     if (file == NULL) {
-
-        send_response(
-            client_fd,
-            "ERR 006 SYSINFO_FAILED SID:9873"
-        );
-
-        return;
+        return -1;
     }
 
-    if (fscanf(file, "%lf", &cpu_load) != 1) {
-
+    if (fscanf(file, "%lf", cpu_load) != 1) {
         fclose(file);
-
-        send_response(
-            client_fd,
-            "ERR 006 SYSINFO_FAILED SID:9873"
-        );
-
-        return;
+        return -1;
     }
-
     fclose(file);
 
-
     file = fopen("/proc/meminfo", "r");
-
     if (file == NULL) {
-
-        send_response(
-            client_fd,
-            "ERR 006 SYSINFO_FAILED SID:9873"
-        );
-
-        return;
+        return -1;
     }
 
     while (fgets(line, sizeof(line), file) != NULL) {
-
-        if (sscanf(
-                line,
-                "MemTotal: %ld kB",
-                &mem_total_kb
-            ) == 1) {
-
+        if (sscanf(line, "MemTotal: %ld kB", &mem_total_kb) == 1) {
             continue;
         }
-
-        if (sscanf(
-                line,
-                "MemAvailable: %ld kB",
-                &mem_available_kb
-            ) == 1) {
-
+        if (sscanf(line, "MemAvailable: %ld kB", &mem_available_kb) == 1) {
             continue;
         }
     }
-
     fclose(file);
 
     if (mem_total_kb <= 0) {
-
-        send_response(
-            client_fd,
-            "ERR 006 SYSINFO_FAILED SID:9873"
-        );
-
-        return;
+        return -1;
     }
 
-    mem_used_mb =
-        (mem_total_kb - mem_available_kb) / 1024;
-
+    *mem_used_mb = (mem_total_kb - mem_available_kb) / 1024;
 
     file = fopen("/proc/uptime", "r");
-
     if (file == NULL) {
-
-        send_response(
-            client_fd,
-            "ERR 006 SYSINFO_FAILED SID:9873"
-        );
-
-        return;
+        return -1;
     }
 
-    if (fscanf(file, "%lf", &uptime) != 1) {
-
+    if (fscanf(file, "%lf", uptime) != 1) {
         fclose(file);
+        return -1;
+    }
+    fclose(file);
 
+    return 0;
+}
+
+/* Per-session UDP monitoring thread */
+void *monitor_thread(void *arg) {
+    monitor_state_t *monitor = (monitor_state_t *)arg;
+
+    while (1) {
+        pthread_mutex_lock(&monitor->mutex);
+        int active = monitor->active;
+        int udp_socket = monitor->udp_socket;
+        struct sockaddr_in target = monitor->target_addr;
+        pthread_mutex_unlock(&monitor->mutex);
+
+        if (!active) {
+            break;
+        }
+
+        double cpu_load = 0.0;
+        double uptime = 0.0;
+        long mem_used_mb = 0;
+
+        if (read_system_stats(&cpu_load, &mem_used_mb, &uptime) == 0) {
+            char datagram[BUFFER_SIZE];
+
+            snprintf(
+                datagram,
+                sizeof(datagram),
+                "SYSINFO %.2f %ld %.0f SID:9873",
+                cpu_load,
+                mem_used_mb,
+                uptime
+            );
+
+            sendto(
+                udp_socket,
+                datagram,
+                strlen(datagram),
+                0,
+                (struct sockaddr *)&target,
+                sizeof(target)
+            );
+        }
+
+        for (int i = 0; i < MONITOR_INTERVAL; i++) {
+            sleep(1);
+
+            pthread_mutex_lock(&monitor->mutex);
+            active = monitor->active;
+            pthread_mutex_unlock(&monitor->mutex);
+
+            if (!active) {
+                break;
+            }
+        }
+    }
+
+    return NULL;
+}
+
+int start_monitor(
+    monitor_state_t *monitor,
+    const struct sockaddr_in *client_addr,
+    int udp_port
+) {
+    stop_monitor(monitor);
+
+    int udp_socket = socket(AF_INET, SOCK_DGRAM, 0);
+    if (udp_socket < 0) {
+        return -1;
+    }
+
+    pthread_mutex_lock(&monitor->mutex);
+    monitor->target_addr = *client_addr;
+    monitor->target_addr.sin_port = htons((unsigned short)udp_port);
+    monitor->udp_socket = udp_socket;
+    monitor->active = 1;
+    pthread_mutex_unlock(&monitor->mutex);
+
+    if (pthread_create(
+            &monitor->thread,
+            NULL,
+            monitor_thread,
+            monitor
+        ) != 0) {
+
+        pthread_mutex_lock(&monitor->mutex);
+        monitor->active = 0;
+        monitor->udp_socket = -1;
+        pthread_mutex_unlock(&monitor->mutex);
+
+        close(udp_socket);
+        return -1;
+    }
+
+    monitor->thread_started = 1;
+    return 0;
+}
+
+void stop_monitor(monitor_state_t *monitor) {
+    pthread_mutex_lock(&monitor->mutex);
+    int was_started = monitor->thread_started;
+    monitor->active = 0;
+    pthread_mutex_unlock(&monitor->mutex);
+
+    if (was_started) {
+        pthread_join(monitor->thread, NULL);
+        monitor->thread_started = 0;
+    }
+
+    pthread_mutex_lock(&monitor->mutex);
+    if (monitor->udp_socket >= 0) {
+        close(monitor->udp_socket);
+        monitor->udp_socket = -1;
+    }
+    pthread_mutex_unlock(&monitor->mutex);
+}
+
+/* SYSINFO */
+void handle_sysinfo(int client_fd) {
+    double cpu_load = 0.0;
+    double uptime = 0.0;
+    long mem_used_mb = 0;
+    char response[BUFFER_SIZE];
+
+    if (read_system_stats(&cpu_load, &mem_used_mb, &uptime) != 0) {
         send_response(
             client_fd,
             "ERR 006 SYSINFO_FAILED SID:9873"
         );
-
         return;
     }
-
-    fclose(file);
 
     snprintf(
         response,
@@ -428,12 +518,8 @@ void handle_sysinfo(int client_fd) {
         uptime
     );
 
-    send_response(
-        client_fd,
-        response
-    );
+    send_response(client_fd, response);
 }
-
 
 /* LISTPROC */
 void handle_listproc(int client_fd) {
@@ -940,13 +1026,19 @@ void handle_get(
 /* Handle each Controller */
 void *handle_client(void *arg) {
 
-    int client_fd = *((int *)arg);
+    client_info_t *client_info = (client_info_t *)arg;
+    int client_fd = client_info->client_fd;
+    struct sockaddr_in client_addr = client_info->client_addr;
 
-    free(arg);
+    free(client_info);
 
     char buffer[BUFFER_SIZE];
-
     int authenticated = 0;
+
+    monitor_state_t monitor;
+    memset(&monitor, 0, sizeof(monitor));
+    monitor.udp_socket = -1;
+    pthread_mutex_init(&monitor.mutex, NULL);
 
     while (1) {
 
@@ -1123,7 +1215,68 @@ void *handle_client(void *arg) {
 }
 
 
+        if (strncmp(buffer, "MONITOR START ", 14) == 0) {
+            char *port_text = buffer + 14;
+            char *endptr = NULL;
+            errno = 0;
+
+            long udp_port = strtol(port_text, &endptr, 10);
+
+            if (
+                errno != 0 ||
+                endptr == port_text ||
+                *endptr != '\0' ||
+                udp_port < 1 ||
+                udp_port > 65535
+            ) {
+                send_response(
+                    client_fd,
+                    "ERR 011 INVALID_UDP_PORT SID:9873"
+                );
+                continue;
+            }
+
+            if (start_monitor(
+                    &monitor,
+                    &client_addr,
+                    (int)udp_port
+                ) != 0) {
+
+                send_response(
+                    client_fd,
+                    "ERR 012 MONITOR_FAILED SID:9873"
+                );
+                continue;
+            }
+
+            send_response(
+                client_fd,
+                "OK MONITOR_STARTED SID:9873"
+            );
+
+            printf(
+                "[MONITOR] UDP stream started to %s:%ld\n",
+                inet_ntoa(client_addr.sin_addr),
+                udp_port
+            );
+
+            continue;
+        }
+
+        if (strcmp(buffer, "MONITOR STOP") == 0) {
+            stop_monitor(&monitor);
+
+            send_response(
+                client_fd,
+                "OK MONITOR_STOPPED SID:9873"
+            );
+
+            printf("[MONITOR] UDP stream stopped\n");
+            continue;
+        }
+
         if (strcmp(buffer, "QUIT") == 0) {
+            stop_monitor(&monitor);
 
             send_response(
                 client_fd,
@@ -1139,6 +1292,9 @@ void *handle_client(void *arg) {
             "ERR 003 UNKNOWN_COMMAND SID:9873"
         );
     }
+
+    stop_monitor(&monitor);
+    pthread_mutex_destroy(&monitor.mutex);
 
     close(client_fd);
 

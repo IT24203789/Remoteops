@@ -6,10 +6,17 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <pthread.h>
+#include <sys/time.h>
 
 #define PORT 9410
 #define BUFFER_SIZE 4096
 #define MAX_FILE_SIZE (10LL * 1024 * 1024)
+
+static int udp_socket_fd = -1;
+static int udp_listener_running = 0;
+static pthread_t udp_listener_tid;
+static pthread_mutex_t udp_listener_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 int recv_line(int sockfd, char *buffer, int maxlen);
 
@@ -27,6 +34,11 @@ int handle_get(
     int sockfd,
     const char *filename
 );
+
+void *udp_listener_thread(void *arg);
+int start_udp_listener(int udp_port);
+void stop_udp_listener(void);
+int send_text_command(int sockfd, const char *command, char *response, int response_size);
 int main(int argc, char *argv[]) {
 
     int sockfd;
@@ -189,6 +201,71 @@ if (strncmp(
     continue;
 }
 
+        /* MONITOR START needs a local UDP listener before TCP request. */
+        if (strncmp(command, "MONITOR START ", 14) == 0) {
+            char *port_text = command + 14;
+            char *endptr = NULL;
+            errno = 0;
+
+            long udp_port = strtol(port_text, &endptr, 10);
+
+            if (
+                errno != 0 ||
+                endptr == port_text ||
+                *endptr != '\0' ||
+                udp_port < 1 ||
+                udp_port > 65535
+            ) {
+                printf("Usage: MONITOR START <udp_port>\n");
+                continue;
+            }
+
+            if (start_udp_listener((int)udp_port) != 0) {
+                printf("[-] Could not start UDP listener on port %ld\n", udp_port);
+                continue;
+            }
+
+            int monitor_result = send_text_command(
+                sockfd,
+                command,
+                response,
+                sizeof(response)
+            );
+
+            if (monitor_result <= 0) {
+                stop_udp_listener();
+                printf("[-] Agent disconnected\n");
+                break;
+            }
+
+            printf("%s\n", response);
+
+            if (strncmp(response, "OK MONITOR_STARTED", 18) != 0) {
+                stop_udp_listener();
+            }
+
+            continue;
+        }
+
+        if (strcmp(command, "MONITOR STOP") == 0) {
+            int monitor_result = send_text_command(
+                sockfd,
+                command,
+                response,
+                sizeof(response)
+            );
+
+            if (monitor_result <= 0) {
+                stop_udp_listener();
+                printf("[-] Agent disconnected\n");
+                break;
+            }
+
+            printf("%s\n", response);
+            stop_udp_listener();
+            continue;
+        }
+
 /*
  * Normal text protocol command.
  * Send the command and newline separately so that
@@ -245,11 +322,152 @@ if (
         }
     }
 
+    stop_udp_listener();
     close(sockfd);
 
     return 0;
 }
 
+
+/* Send a normal one-line TCP command and receive one response line. */
+int send_text_command(
+    int sockfd,
+    const char *command,
+    char *response,
+    int response_size
+) {
+    if (
+        send_all(sockfd, command, strlen(command)) != 0 ||
+        send_all(sockfd, "\n", 1) != 0
+    ) {
+        return -1;
+    }
+
+    return recv_line(sockfd, response, response_size);
+}
+
+/* UDP listener used by MONITOR START. */
+void *udp_listener_thread(void *arg) {
+    (void)arg;
+    char buffer[BUFFER_SIZE];
+
+    while (1) {
+        pthread_mutex_lock(&udp_listener_mutex);
+        int running = udp_listener_running;
+        int sockfd = udp_socket_fd;
+        pthread_mutex_unlock(&udp_listener_mutex);
+
+        if (!running || sockfd < 0) {
+            break;
+        }
+
+        ssize_t received = recvfrom(
+            sockfd,
+            buffer,
+            sizeof(buffer) - 1,
+            0,
+            NULL,
+            NULL
+        );
+
+        if (received > 0) {
+            buffer[received] = '\0';
+            printf("\n[UDP MONITOR] %s\nRemoteOps> ", buffer);
+            fflush(stdout);
+            continue;
+        }
+
+        if (received < 0) {
+            if (
+                errno == EAGAIN ||
+                errno == EWOULDBLOCK ||
+                errno == EINTR
+            ) {
+                continue;
+            }
+            break;
+        }
+    }
+
+    return NULL;
+}
+
+int start_udp_listener(int udp_port) {
+    stop_udp_listener();
+
+    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd < 0) {
+        perror("udp socket");
+        return -1;
+    }
+
+    int opt = 1;
+    setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct timeval timeout;
+    timeout.tv_sec = 1;
+    timeout.tv_usec = 0;
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+    struct sockaddr_in udp_addr;
+    memset(&udp_addr, 0, sizeof(udp_addr));
+    udp_addr.sin_family = AF_INET;
+    udp_addr.sin_addr.s_addr = INADDR_ANY;
+    udp_addr.sin_port = htons((unsigned short)udp_port);
+
+    if (bind(
+            sockfd,
+            (struct sockaddr *)&udp_addr,
+            sizeof(udp_addr)
+        ) < 0) {
+
+        perror("udp bind");
+        close(sockfd);
+        return -1;
+    }
+
+    pthread_mutex_lock(&udp_listener_mutex);
+    udp_socket_fd = sockfd;
+    udp_listener_running = 1;
+    pthread_mutex_unlock(&udp_listener_mutex);
+
+    if (pthread_create(
+            &udp_listener_tid,
+            NULL,
+            udp_listener_thread,
+            NULL
+        ) != 0) {
+
+        pthread_mutex_lock(&udp_listener_mutex);
+        udp_listener_running = 0;
+        udp_socket_fd = -1;
+        pthread_mutex_unlock(&udp_listener_mutex);
+
+        close(sockfd);
+        return -1;
+    }
+
+    printf("[+] UDP listener started on port %d\n", udp_port);
+    return 0;
+}
+
+void stop_udp_listener(void) {
+    pthread_mutex_lock(&udp_listener_mutex);
+    int was_running = udp_listener_running;
+    udp_listener_running = 0;
+    pthread_mutex_unlock(&udp_listener_mutex);
+
+    if (was_running) {
+        pthread_join(udp_listener_tid, NULL);
+    }
+
+    pthread_mutex_lock(&udp_listener_mutex);
+    if (udp_socket_fd >= 0) {
+        close(udp_socket_fd);
+        udp_socket_fd = -1;
+    }
+    pthread_mutex_unlock(&udp_listener_mutex);
+}
 
 /* Send exactly length bytes */
 int send_all(
